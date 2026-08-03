@@ -1,0 +1,415 @@
+#!/usr/bin/env bash
+# Transparent Linux front end for the legion_gpu_mode kernel module.
+
+set -Eeuo pipefail
+
+MODULE_NAME="legion_gpu_mode"
+PARAM_DIR="/sys/module/${MODULE_NAME}/parameters"
+MODE_FILE="${PARAM_DIR}/mode"
+NOTIFY_FILE="${PARAM_DIR}/notify_dgpu"
+SUPPORT_FILE="${PARAM_DIR}/support"
+DEFAULT_MODE_TIMEOUT=10
+DEFAULT_RECONNECT_TIMEOUT=15
+FIRMWARE_SETTLE_SECONDS=1
+FORCE=0
+NO_SUSPEND=0
+
+log()  { printf '%s\n' "$*"; }
+warn() { printf 'Warning: %s\n' "$*" >&2; }
+die()  { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+	cat <<'USAGE'
+Usage:
+  legion-gpu-mode status
+  legion-gpu-mode igpu [--no-suspend] [--force]
+  legion-gpu-mode hybrid [--force]
+
+Commands:
+  status   Show Lenovo mode and currently enumerated display GPUs.
+  igpu     Set Hybrid-iGPU mode, notify firmware, then suspend once.
+  hybrid   Restore Hybrid mode without suspending.
+
+Options:
+  --no-suspend  Set Hybrid-iGPU but do not suspend; useful for diagnosis.
+  --force       Ignore detected NVIDIA users or connected NVIDIA displays.
+
+Modes reported by firmware:
+  0 = Hybrid, 1 = Hybrid-iGPU, 2 = Auto, 3 = dGPU
+USAGE
+}
+
+require_root() {
+	if [[ ${EUID} -ne 0 ]]; then
+		command -v sudo >/dev/null 2>&1 || die "This operation needs root and sudo is unavailable."
+		exec sudo -- "$0" "$@"
+	fi
+}
+
+ensure_module() {
+	if [[ ! -d ${PARAM_DIR} ]]; then
+		modprobe "${MODULE_NAME}" || {
+			warn "Could not load ${MODULE_NAME}."
+			warn "Inspect: sudo dmesg | tail -n 50"
+			warn "With Secure Boot enabled, an unsigned local module may be rejected."
+			exit 1
+		}
+	fi
+
+	[[ -r ${MODE_FILE} ]] || die "${MODE_FILE} is unavailable."
+	[[ -w ${MODE_FILE} ]] || die "${MODE_FILE} is not writable; run as root."
+}
+
+is_display_pci_device() {
+	local device=$1 vendor class
+	[[ -r ${device}/vendor && -r ${device}/class ]] || return 1
+	vendor=$(<"${device}/vendor")
+	class=$(<"${device}/class")
+	[[ ${class} == 0x03* ]] || return 1
+	[[ ${vendor} == 0x10de || ${vendor} == 0x8086 || ${vendor} == 0x1002 ]]
+}
+
+nvidia_devices() {
+	local device vendor class
+	for device in /sys/bus/pci/devices/*; do
+		[[ -r ${device}/vendor && -r ${device}/class ]] || continue
+		vendor=$(<"${device}/vendor")
+		class=$(<"${device}/class")
+		if [[ ${vendor} == 0x10de && ${class} == 0x03* ]]; then
+			printf '%s\n' "${device}"
+		fi
+	done
+}
+
+nvidia_present() {
+	local first
+	first=$(nvidia_devices | head -n 1 || true)
+	[[ -n ${first} ]]
+}
+
+integrated_gpu_present() {
+	local device vendor class
+	for device in /sys/bus/pci/devices/*; do
+		[[ -r ${device}/vendor && -r ${device}/class ]] || continue
+		vendor=$(<"${device}/vendor")
+		class=$(<"${device}/class")
+		if [[ ${class} == 0x03* && ( ${vendor} == 0x8086 || ${vendor} == 0x1002 ) ]]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+nvidia_connected_outputs() {
+	local device status_file status connector
+	while IFS= read -r device; do
+		[[ -n ${device} && -d ${device}/drm ]] || continue
+		while IFS= read -r -d '' status_file; do
+			status=$(<"${status_file}")
+			if [[ ${status} == connected ]]; then
+				connector=${status_file%/status}
+				printf '%s\n' "${connector##*/}"
+			fi
+		done < <(find "${device}/drm" -maxdepth 3 -type f -name status -print0 2>/dev/null)
+	done < <(nvidia_devices)
+}
+
+nvidia_device_nodes() {
+	local device drm_entry node
+	local -A seen=()
+
+	shopt -s nullglob
+	for node in /dev/nvidia*; do
+		[[ -e ${node} ]] || continue
+		seen["${node}"]=1
+	done
+	shopt -u nullglob
+
+	while IFS= read -r device; do
+		[[ -n ${device} && -d ${device}/drm ]] || continue
+		while IFS= read -r -d '' drm_entry; do
+			node="/dev/dri/${drm_entry##*/}"
+			[[ -e ${node} ]] && seen["${node}"]=1
+		done < <(find "${device}/drm" -mindepth 1 -maxdepth 1 \
+			\( -name 'card*' -o -name 'renderD*' \) -print0 2>/dev/null)
+	done < <(nvidia_devices)
+
+	for node in "${!seen[@]}"; do
+		printf '%s\n' "${node}"
+	done
+}
+
+nvidia_users() {
+	local nodes=()
+	mapfile -t nodes < <(nvidia_device_nodes)
+	((${#nodes[@]} > 0)) || return 0
+
+	if command -v fuser >/dev/null 2>&1; then
+		fuser -v "${nodes[@]}" 2>&1 || true
+		return 0
+	fi
+
+	if command -v lsof >/dev/null 2>&1; then
+		lsof -- "${nodes[@]}" 2>&1 || true
+		return 0
+	fi
+
+	return 3
+}
+
+mode_name() {
+	case "$1" in
+		0) printf 'Hybrid' ;;
+		1) printf 'Hybrid-iGPU' ;;
+		2) printf 'Auto' ;;
+		3) printf 'dGPU' ;;
+		*) printf 'Unknown' ;;
+	esac
+}
+
+read_mode() {
+	tr -d '[:space:]' < "${MODE_FILE}"
+}
+
+try_set_mode() {
+	local target=$1 timeout=${2:-${DEFAULT_MODE_TIMEOUT}}
+	local deadline current
+
+	printf '%s\n' "${target}" > "${MODE_FILE}" || return 1
+	deadline=$((SECONDS + timeout))
+	while ((SECONDS < deadline)); do
+		sleep 0.25
+		current=$(read_mode) || return 1
+		[[ ${current} == "${target}" ]] && return 0
+	done
+
+	return 1
+}
+
+set_mode() {
+	local target=$1 timeout=${2:-${DEFAULT_MODE_TIMEOUT}}
+	local current
+
+	if try_set_mode "${target}" "${timeout}"; then
+		return 0
+	fi
+
+	current=$(read_mode 2>/dev/null || printf unknown)
+	die "Firmware mode is ${current} ($(mode_name "${current}")); expected ${target} ($(mode_name "${target}"))."
+}
+
+notify_current_dgpu_state() {
+	if nvidia_present; then
+		printf '1\n' > "${NOTIFY_FILE}"
+		log "Sent NotifyDGPUStatus(1): NVIDIA is currently enumerated."
+	else
+		printf '0\n' > "${NOTIFY_FILE}"
+		log "Sent NotifyDGPUStatus(0): NVIDIA is currently absent."
+	fi
+}
+
+suspend_system() {
+	log "Suspending Linux now. Wake the laptop normally."
+
+	if command -v systemctl >/dev/null 2>&1; then
+		systemctl suspend && return 0
+		warn "systemctl suspend failed."
+	fi
+
+	if command -v loginctl >/dev/null 2>&1; then
+		loginctl suspend && return 0
+		warn "loginctl suspend failed."
+	fi
+
+	if [[ -w /sys/power/state ]] && grep -qw mem /sys/power/state; then
+		printf 'mem\n' > /sys/power/state && return 0
+		warn "Writing mem to /sys/power/state failed."
+	fi
+
+	return 1
+}
+
+rollback_mode() {
+	local target=$1
+	warn "Suspend failed; restoring the previous mode: ${target} ($(mode_name "${target}"))."
+	if ! try_set_mode "${target}"; then
+		warn "Automatic rollback failed. Run the appropriate mode command manually."
+		return 1
+	fi
+
+	sleep "${FIRMWARE_SETTLE_SECONDS}"
+	notify_current_dgpu_state || warn "The previous mode was restored, but NotifyDGPUStatus failed."
+	log "Previous Lenovo mode restored after the failed suspend request."
+}
+
+show_devices() {
+	local device vendor class driver power
+	log "Present display PCI devices:"
+	for device in /sys/bus/pci/devices/*; do
+		is_display_pci_device "${device}" || continue
+		vendor=$(<"${device}/vendor")
+		class=$(<"${device}/class")
+		driver="none"
+		[[ -L ${device}/driver ]] && driver=$(basename "$(readlink -f "${device}/driver")")
+		power="unknown"
+		[[ -r ${device}/power/runtime_status ]] && power=$(<"${device}/power/runtime_status")
+		printf '  %-12s vendor=%s class=%s driver=%s runtime=%s\n' \
+			"${device##*/}" "${vendor}" "${class}" "${driver}" "${power}"
+	done
+}
+
+show_status() {
+	local mode support
+	ensure_module
+	mode=$(read_mode)
+	support=$(tr -d '[:space:]' < "${SUPPORT_FILE}")
+	log "Lenovo GPU mode: ${mode} ($(mode_name "${mode}"))"
+	log "Firmware iGPU support value: ${support}"
+	log "NVIDIA enumerated: $(nvidia_present && printf yes || printf no)"
+	show_devices
+}
+
+check_igpu_preconditions() {
+	local outputs users user_check_status
+
+	integrated_gpu_present || die "No Intel or AMD integrated display GPU is present. Refusing Hybrid-iGPU mode."
+
+	outputs=$(nvidia_connected_outputs || true)
+	if [[ -n ${outputs} ]]; then
+		warn "Connected display output(s) on NVIDIA:"
+		printf '%s\n' "${outputs}" >&2
+		((FORCE)) || die "Disconnect NVIDIA-wired external displays or rerun with --force."
+	fi
+
+	if users=$(nvidia_users); then
+		user_check_status=0
+	else
+		user_check_status=$?
+	fi
+
+	if ((user_check_status == 3)); then
+		warn "Neither fuser nor lsof is installed, so NVIDIA device use cannot be checked."
+		((FORCE)) || die "Install psmisc or lsof, or rerun with --force after closing GPU applications."
+	elif [[ -n ${users//[[:space:]]/} ]]; then
+		warn "Processes appear to be using NVIDIA device nodes:"
+		printf '%s\n' "${users}" >&2
+		((FORCE)) || die "Close those processes or rerun with --force."
+	fi
+}
+
+switch_to_igpu() {
+	local current original_mode mode_changed=0
+	ensure_module
+	check_igpu_preconditions
+	current=$(read_mode)
+	original_mode=${current}
+
+	log "Current Lenovo mode: ${current} ($(mode_name "${current}"))"
+	if [[ ${current} != 1 ]]; then
+		log "Setting Hybrid-iGPU mode..."
+		set_mode 1
+		mode_changed=1
+	else
+		log "Hybrid-iGPU is already selected."
+	fi
+
+	log "Waiting ${FIRMWARE_SETTLE_SECONDS}s for firmware..."
+	sleep "${FIRMWARE_SETTLE_SECONDS}"
+	notify_current_dgpu_state
+
+	if ((NO_SUSPEND)); then
+		warn "--no-suspend was requested. The RTX normally remains present until suspend/resume."
+		show_status
+		return 0
+	fi
+
+	if ! suspend_system; then
+		if ((mode_changed)); then
+			rollback_mode "${original_mode}" || true
+		else
+		warn "Hybrid-iGPU was already selected before this command; no mode rollback was needed."
+		fi
+		die "Linux suspend failed. Previous-mode rollback was attempted when applicable."
+	fi
+
+	log "Linux resumed. Checking immediately..."
+	current=$(read_mode)
+	log "Lenovo mode after resume: ${current} ($(mode_name "${current}"))"
+	show_devices
+
+	if nvidia_present; then
+		warn "Hybrid-iGPU is selected, but NVIDIA is still enumerated."
+		warn "Close GPU applications, disconnect NVIDIA-wired displays, and try once more."
+		return 2
+	fi
+
+	log "Success: NVIDIA is absent from the PCI display-device list."
+}
+
+switch_to_hybrid() {
+	local current deadline
+	ensure_module
+	current=$(read_mode)
+	log "Current Lenovo mode: ${current} ($(mode_name "${current}"))"
+
+	if [[ ${current} != 0 ]]; then
+		log "Setting Hybrid mode..."
+		set_mode 0
+	else
+		log "Hybrid is already selected."
+	fi
+
+	log "Waiting 5s for firmware and PCI enumeration..."
+	sleep 5
+	notify_current_dgpu_state
+
+	if ! nvidia_present; then
+		log "NVIDIA is still absent; requesting a PCI rescan."
+		printf '1\n' > /sys/bus/pci/rescan
+	fi
+
+	deadline=$((SECONDS + DEFAULT_RECONNECT_TIMEOUT))
+	while ! nvidia_present && ((SECONDS < deadline)); do
+		sleep 1
+	done
+
+	show_devices
+	if nvidia_present; then
+		log "Success: Hybrid mode is active and NVIDIA is enumerated. No suspend was used."
+		return 0
+	fi
+
+	warn "Hybrid mode is selected, but NVIDIA did not return within ${DEFAULT_RECONNECT_TIMEOUT}s."
+	warn "A reboot may be required if another PCI rescan does not restore it."
+	return 2
+}
+
+main() {
+	local original_args=("$@")
+	local command=${1:-help}
+	shift || true
+
+	case "${command}" in
+		help|-h|--help) usage; exit 0 ;;
+		status|igpu|hybrid) require_root "${original_args[@]}" ;;
+		*) usage >&2; exit 1 ;;
+	esac
+
+	while (($#)); do
+		case "$1" in
+			--force) FORCE=1 ;;
+			--no-suspend) NO_SUSPEND=1 ;;
+			-h|--help) usage; exit 0 ;;
+			*) die "Unknown option: $1" ;;
+		esac
+		shift
+	done
+
+	case "${command}" in
+		status) show_status ;;
+		igpu) switch_to_igpu ;;
+		hybrid) switch_to_hybrid ;;
+	esac
+}
+
+main "$@"
