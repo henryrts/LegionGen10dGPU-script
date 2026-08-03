@@ -1,6 +1,6 @@
-# Lenovo Legion GPU mode scripts — v3 Fast
+# Lenovo Legion GPU mode scripts
 
-For Lenovo Legion Pro 5 16IAX10H (`83LU`).
+For Lenovo Legion Pro 5 16IAX10H (`83LU`), but can be used for all Legion 5 Gen 10 machines
 
 ## Launchers
 
