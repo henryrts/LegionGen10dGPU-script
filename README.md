@@ -5,7 +5,7 @@ For Lenovo Legion Pro 5 16IAX10H (`83LU`), but can be used for all Legion 5 Gen 
 ## Launchers
 
 - `Start-iGPU-Fast.cmd` — switches Hybrid → Hybrid-iGPU, then sleeps.
-- `Start-Hybrid.cmd` — switches Hybrid-iGPU → Hybrid without sleeping.
+- `Start-Hybrid.cmd` — switches Hybrid-iGPU → Hybrid, retries while awake, then uses one normal sleep/resume cycle if NVIDIA is still absent.
 
 Both launchers request administrator rights immediately and then run the matching readable PowerShell file.
 
@@ -16,7 +16,7 @@ Both launchers request administrator rights immediately and then run the matchin
 3. Double-click `Start-iGPU-Fast.cmd`.
 4. Approve the single UAC prompt.
 5. Wake the laptop normally.
-6. Double-click `Start-Hybrid.cmd` when you want the RTX back; that direction does not sleep.
+6. Double-click `Start-Hybrid.cmd` when you want the RTX back. It first retries without sleeping. If NVIDIA remains disconnected, it enters normal Windows sleep once; wake the laptop normally so the script can verify the result.
 
 ## Transparency and security
 
@@ -37,7 +37,8 @@ The PowerShell scripts are plain text. They only:
 - read or set `IGPUModeStatus`;
 - send Lenovo's local `NotifyDGPUStatus` notification;
 - inspect locally present display adapters;
-- request normal Windows sleep with the hibernate argument explicitly set to `false` in the iGPU script;
+- request a local Windows Plug and Play hardware scan;
+- request normal Windows sleep with the hibernate argument explicitly set to `false`;
 - print the detected state and result.
 
 ## Optional tuning
@@ -49,7 +50,16 @@ The iGPU PowerShell script accepts:
 -ResumeCheckTimeoutSeconds 3
 ```
 
-If the 1-second firmware delay ever proves unreliable, increase it to `2000` or restore `5000`.
+The Hybrid PowerShell script accepts:
+
+```powershell
+-ReconnectWaitSeconds 15
+-ResumeCheckTimeoutSeconds 10
+```
+
+`ReconnectWaitSeconds` controls the awake retry period. `ResumeCheckTimeoutSeconds` controls how long the script checks for NVIDIA after waking from the fallback sleep.
+
+If the iGPU script's 1-second firmware delay ever proves unreliable, increase it to `2000` or restore `5000`.
 
 ## Administrator rights
 

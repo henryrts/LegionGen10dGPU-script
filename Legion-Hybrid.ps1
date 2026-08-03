@@ -2,15 +2,17 @@
 [CmdletBinding()]
 param(
     [ValidateRange(1, 60)]
-    [int]$ReconnectWaitSeconds = 15
+    [int]$ReconnectWaitSeconds = 15,
+
+    [ValidateRange(0, 60)]
+    [int]$ResumeCheckTimeoutSeconds = 10
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $TargetMode = 0
-$TargetModeName = 'Hybrid'
-$FirmwareSettleSeconds = 5
+$ReconnectRetryIntervalSeconds = 3
 
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -24,7 +26,7 @@ function Restart-AsAdministrator {
     }
 
     $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ReconnectWaitSeconds $ReconnectWaitSeconds"
+    $arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ReconnectWaitSeconds $ReconnectWaitSeconds -ResumeCheckTimeoutSeconds $ResumeCheckTimeoutSeconds"
 
     Start-Process -FilePath $windowsPowerShell -Verb RunAs -ArgumentList $arguments | Out-Null
     exit
@@ -124,6 +126,105 @@ function Test-NvidiaPresent {
     }
 }
 
+function Wait-NvidiaPresent {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateRange(0, 60)]
+        [int]$TimeoutSeconds
+    )
+
+    if (Test-NvidiaPresent) {
+        return $true
+    }
+
+    if ($TimeoutSeconds -eq 0) {
+        return $false
+    }
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        Start-Sleep -Milliseconds 500
+        if (Test-NvidiaPresent) {
+            return $true
+        }
+    } while ((Get-Date) -lt $deadline)
+
+    return $false
+}
+
+function Invoke-PnpHardwareScan {
+    $pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
+
+    if (-not (Test-Path -LiteralPath $pnputil)) {
+        Write-Warning "Windows PnP utility was not found at $pnputil."
+        return
+    }
+
+    Write-Host 'Requesting a Windows Plug and Play hardware scan...'
+    & $pnputil /scan-devices | Out-Host
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "pnputil.exe /scan-devices returned exit code $LASTEXITCODE."
+    }
+}
+
+function Request-DGPUReconnect {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 100)]
+        [int]$Attempt
+    )
+
+    Write-Host "dGPU reconnect attempt $Attempt..." -ForegroundColor Cyan
+
+    try {
+        Set-LegionIGPUModeStatus -Mode $TargetMode
+        Write-Host 'Reasserted Lenovo Hybrid mode (value 0).'
+    }
+    catch {
+        Write-Warning "Could not reassert Hybrid mode: $($_.Exception.Message)"
+    }
+
+    try {
+        # Experimental: status 1 is retained from the previous PR for this controlled test.
+        Send-LegionDGPUStatusNotification -Status 1
+        Write-Host 'Sent experimental NotifyDGPUStatus(1).'
+    }
+    catch {
+        Write-Warning "NotifyDGPUStatus(1) failed: $($_.Exception.Message)"
+    }
+
+    Invoke-PnpHardwareScan
+}
+
+function Invoke-SystemSleep {
+    if (-not ('LegionGpuMode.NativePower' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Runtime.InteropServices;
+
+namespace LegionGpuMode
+{
+    public static class NativePower
+    {
+        [DllImport("powrprof.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        public static extern bool SetSuspendState(
+            [MarshalAs(UnmanagedType.Bool)] bool hibernate,
+            [MarshalAs(UnmanagedType.Bool)] bool forceCritical,
+            [MarshalAs(UnmanagedType.Bool)] bool disableWakeEvent);
+    }
+}
+'@
+    }
+
+    Write-Host 'Entering normal Windows sleep now...' -ForegroundColor Yellow
+    $succeeded = [LegionGpuMode.NativePower]::SetSuspendState($false, $false, $false)
+    if (-not $succeeded) {
+        $errorCode = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+        throw "Windows sleep request failed. Win32 error: $errorCode"
+    }
+}
+
 function Show-PresentDisplayAdapters {
     Write-Host ''
     Write-Host 'Present display adapters:' -ForegroundColor Cyan
@@ -154,7 +255,7 @@ try {
 
     Write-Host 'Lenovo Legion GPU mode switch' -ForegroundColor Cyan
     Write-Host 'Target: Hybrid (value 0)'
-    Write-Host 'This direction does not put Windows to sleep.' -ForegroundColor Green
+    Write-Host 'Fallback: one normal sleep/resume cycle if awake reconnect attempts fail.' -ForegroundColor Yellow
     Write-Host 'Close Legion Space and Lenovo Legion Toolkit before continuing.' -ForegroundColor DarkYellow
     Write-Host ''
 
@@ -179,38 +280,71 @@ try {
     }
 
     Write-Host 'Hybrid mode verified (value 0).' -ForegroundColor Green
-    Write-Host "Waiting $FirmwareSettleSeconds seconds for firmware and device enumeration..."
-    Start-Sleep -Seconds $FirmwareSettleSeconds
 
+    $usedSleepFallback = $false
     $nvidiaPresent = Test-NvidiaPresent
-    $notificationValue = if ($nvidiaPresent) { 1 } else { 0 }
 
-    try {
-        Send-LegionDGPUStatusNotification -Status $notificationValue
-        Write-Host "Sent NotifyDGPUStatus($notificationValue)."
-    }
-    catch {
-        Write-Warning "NotifyDGPUStatus failed, but Hybrid mode was set successfully: $($_.Exception.Message)"
+    if (-not $nvidiaPresent) {
+        Write-Host "NVIDIA is still disconnected. Retrying awake for up to $ReconnectWaitSeconds seconds..." -ForegroundColor Cyan
+
+        $reconnectDeadline = (Get-Date).AddSeconds($ReconnectWaitSeconds)
+        $attempt = 0
+
+        do {
+            $attempt++
+            Request-DGPUReconnect -Attempt $attempt
+
+            $attemptDeadline = (Get-Date).AddSeconds($ReconnectRetryIntervalSeconds)
+            if ($attemptDeadline -gt $reconnectDeadline) {
+                $attemptDeadline = $reconnectDeadline
+            }
+
+            do {
+                Start-Sleep -Milliseconds 500
+                $nvidiaPresent = Test-NvidiaPresent
+            } while (-not $nvidiaPresent -and (Get-Date) -lt $attemptDeadline)
+        } while (-not $nvidiaPresent -and (Get-Date) -lt $reconnectDeadline)
     }
 
     if (-not $nvidiaPresent) {
-        Write-Host "Waiting up to $ReconnectWaitSeconds seconds for NVIDIA to reconnect..." -ForegroundColor Cyan
+        $usedSleepFallback = $true
+        Write-Host ''
+        Write-Host 'Awake reconnect attempts failed. Testing one sleep/resume cycle...' -ForegroundColor Yellow
+        Write-Host 'Wake the laptop normally after it enters sleep.' -ForegroundColor Yellow
 
-        $reconnectDeadline = (Get-Date).AddSeconds($ReconnectWaitSeconds)
-        do {
-            Start-Sleep -Seconds 1
-            $nvidiaPresent = Test-NvidiaPresent
-        } while (-not $nvidiaPresent -and (Get-Date) -lt $reconnectDeadline)
+        # Reassert Hybrid immediately before sleeping so firmware enters the power transition with mode 0 selected.
+        Set-LegionIGPUModeStatus -Mode $TargetMode
+        Start-Sleep -Milliseconds 1000
+        Invoke-SystemSleep
+
+        Write-Host 'Windows resumed. Reopening Lenovo WMI and checking NVIDIA...' -ForegroundColor Cyan
+        Initialize-LenovoGameZone
+
+        $modeAfterResume = Get-LegionIGPUModeStatus
+        Write-Host "Lenovo mode after resume: $modeAfterResume"
+
+        if ($modeAfterResume -ne $TargetMode) {
+            Write-Warning "Lenovo mode changed during sleep. Reapplying Hybrid (value 0)."
+            Set-LegionIGPUModeStatus -Mode $TargetMode
+        }
+
+        Invoke-PnpHardwareScan
+        $nvidiaPresent = Wait-NvidiaPresent -TimeoutSeconds $ResumeCheckTimeoutSeconds
     }
 
     Show-PresentDisplayAdapters
 
     if ($nvidiaPresent) {
-        Write-Host 'Success: Hybrid mode is active and NVIDIA is present. No sleep was used.' -ForegroundColor Green
+        if ($usedSleepFallback) {
+            Write-Host 'Success: NVIDIA returned after the Hybrid sleep/resume fallback.' -ForegroundColor Green
+        }
+        else {
+            Write-Host 'Success: Hybrid mode is active and NVIDIA returned without sleep.' -ForegroundColor Green
+        }
         exit 0
     }
 
-    Write-Warning 'Hybrid mode is selected, but NVIDIA has not reappeared yet. Try Device Manager > Scan for hardware changes; restart Windows only if it still remains absent.'
+    Write-Warning 'Hybrid mode is selected, but NVIDIA did not return even after one sleep/resume cycle. Legion Space likely performs an additional Lenovo-specific operation that this script does not yet reproduce.'
     exit 2
 }
 catch {
