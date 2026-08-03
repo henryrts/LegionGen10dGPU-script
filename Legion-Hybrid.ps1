@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 
 $TargetMode = 0
 $TargetModeName = 'Hybrid'
-$FirmwareSettleSeconds = 5
+$ReconnectRetryIntervalSeconds = 3
 
 function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -124,6 +124,52 @@ function Test-NvidiaPresent {
     }
 }
 
+function Invoke-PnpHardwareScan {
+    $pnputil = Join-Path $env:SystemRoot 'System32\pnputil.exe'
+
+    if (-not (Test-Path -LiteralPath $pnputil)) {
+        Write-Warning "Windows PnP utility was not found at $pnputil."
+        return
+    }
+
+    Write-Host 'Requesting a Windows Plug and Play hardware scan...'
+    & $pnputil /scan-devices | Out-Host
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "pnputil.exe /scan-devices returned exit code $LASTEXITCODE."
+    }
+}
+
+function Request-DGPUReconnect {
+    param(
+        [Parameter(Mandatory)]
+        [ValidateRange(1, 100)]
+        [int]$Attempt
+    )
+
+    Write-Host "dGPU reconnect attempt $Attempt..." -ForegroundColor Cyan
+
+    try {
+        # Reasserting Hybrid mode gives Lenovo firmware another opportunity to power and enumerate the dGPU.
+        Set-LegionIGPUModeStatus -Mode $TargetMode
+        Write-Host 'Reasserted Lenovo Hybrid mode (value 0).'
+    }
+    catch {
+        Write-Warning "Could not reassert Hybrid mode: $($_.Exception.Message)"
+    }
+
+    try {
+        # Hybrid expects the dGPU to be available. Do not report the currently absent device as status 0.
+        Send-LegionDGPUStatusNotification -Status 1
+        Write-Host 'Sent NotifyDGPUStatus(1) for the Hybrid target state.'
+    }
+    catch {
+        Write-Warning "NotifyDGPUStatus(1) failed: $($_.Exception.Message)"
+    }
+
+    Invoke-PnpHardwareScan
+}
+
 function Show-PresentDisplayAdapters {
     Write-Host ''
     Write-Host 'Present display adapters:' -ForegroundColor Cyan
@@ -179,27 +225,28 @@ try {
     }
 
     Write-Host 'Hybrid mode verified (value 0).' -ForegroundColor Green
-    Write-Host "Waiting $FirmwareSettleSeconds seconds for firmware and device enumeration..."
-    Start-Sleep -Seconds $FirmwareSettleSeconds
 
     $nvidiaPresent = Test-NvidiaPresent
-    $notificationValue = if ($nvidiaPresent) { 1 } else { 0 }
-
-    try {
-        Send-LegionDGPUStatusNotification -Status $notificationValue
-        Write-Host "Sent NotifyDGPUStatus($notificationValue)."
-    }
-    catch {
-        Write-Warning "NotifyDGPUStatus failed, but Hybrid mode was set successfully: $($_.Exception.Message)"
-    }
 
     if (-not $nvidiaPresent) {
-        Write-Host "Waiting up to $ReconnectWaitSeconds seconds for NVIDIA to reconnect..." -ForegroundColor Cyan
+        Write-Host "NVIDIA is still disconnected. Retrying for up to $ReconnectWaitSeconds seconds..." -ForegroundColor Cyan
 
         $reconnectDeadline = (Get-Date).AddSeconds($ReconnectWaitSeconds)
+        $attempt = 0
+
         do {
-            Start-Sleep -Seconds 1
-            $nvidiaPresent = Test-NvidiaPresent
+            $attempt++
+            Request-DGPUReconnect -Attempt $attempt
+
+            $attemptDeadline = (Get-Date).AddSeconds($ReconnectRetryIntervalSeconds)
+            if ($attemptDeadline -gt $reconnectDeadline) {
+                $attemptDeadline = $reconnectDeadline
+            }
+
+            do {
+                Start-Sleep -Milliseconds 500
+                $nvidiaPresent = Test-NvidiaPresent
+            } while (-not $nvidiaPresent -and (Get-Date) -lt $attemptDeadline)
         } while (-not $nvidiaPresent -and (Get-Date) -lt $reconnectDeadline)
     }
 
@@ -210,7 +257,7 @@ try {
         exit 0
     }
 
-    Write-Warning 'Hybrid mode is selected, but NVIDIA has not reappeared yet. Try Device Manager > Scan for hardware changes; restart Windows only if it still remains absent.'
+    Write-Warning 'Hybrid mode is selected, but Lenovo firmware did not reconnect NVIDIA. Restart Windows to recover the dGPU; a PnP scan cannot enumerate hardware that the EC has not powered back on.'
     exit 2
 }
 catch {
