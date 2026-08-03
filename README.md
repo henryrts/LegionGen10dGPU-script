@@ -15,10 +15,10 @@ All launchers request administrator rights immediately and launch the PowerShell
 
 1. Close Legion Space and Lenovo Legion Toolkit.
 2. Disconnect any display connected through an NVIDIA-wired port.
-3. Double-click `Start-iGPU-Fast.vbs`.
+3. Double-click `Start-iGPU-Fast.cmd`.
 4. Approve the single UAC prompt.
 5. Wake the laptop normally.
-6. Double-click `Start-Hybrid.vbs` when you want the RTX back; that direction does not sleep.
+6. Double-click `Start-Hybrid.cmd` when you want the RTX back; that direction does not sleep.
 
 ## Optional tuning
 
